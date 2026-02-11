@@ -1,0 +1,70 @@
+# STM32 Build Outputs
+*.o
+*.d
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.su
+
+# Keil MDK
+*.uvoptx
+*.uvprojx
+*.bak
+*.dep
+*.d43
+*.axf
+*.tra
+*.lnp
+*.plg
+*.sct
+*.build_log.htm
+
+# IAR EWARM
+*.ewp
+*.eww
+*.ewd
+*.ewt
+*.wsdt
+*.pbd
+*.pbi
+*.sim
+*.bin
+
+# STM32CubeIDE
+.metadata/
+.settings/
+*.launch
+*.cproject
+*.project
+Debug/
+Release/
+
+# C/C++ Build
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# MX Project
+*.mxproject
+
+# Temporary files
+*.tmp
+*.temp
+*.log
