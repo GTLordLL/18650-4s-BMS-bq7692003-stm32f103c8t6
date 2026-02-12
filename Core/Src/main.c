@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "i2c.h"
+#include "tim.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -35,6 +36,11 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define BQ_ADDR (0x08 << 1) // 7位地址0x08，HAL库需要左移一位变成0x10
+#define PROT_UV    3000   // 欠压保护 3.0V
+#define PROT_OV    4200   // 过充保护 4.2V
+#define PROT_OT    60.0f  // 过温保护 60℃
+#define PROT_UT    -5.0f  // 低温保护 -5℃ (禁止充电)
+#define PROT_OC    20000  // 过流保护 20A (根据你的分流电阻能力)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -55,8 +61,14 @@ uint8_t cell_index_map[4] = {0, 1, 2, 4}; // 定义 4 串模式下的寄存器�
 volatile uint8_t mos_state = 0; // 0: 关闭, 1: 开启
 uint32_t last_button_time = 0; // 记录上次触发的时间，防止按键抖动
 volatile uint8_t button_pressed_flag = 0;
-static uint16_t test_val = 0;
 int16_t debug_val = 0;
+uint16_t cells[4];
+int16_t curr;
+float t;
+uint8_t error_flag = 0;
+volatile uint8_t timer_100ms_flag = 0;
+uint16_t task_counter = 0;
+uint16_t uv_counter = 0; // 欠压计数器
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -124,8 +136,6 @@ void BQ76920_Read_ADC_Params(void) {
            单位是 uV/LSB
         */
         uint16_t gain_uV = 365 + ((uint16_t)(g1 & 0x0C) << 1) + ((uint16_t)(g2 & 0xE0) >> 5);
-		
-		   debug_val = gain_uV;
 		   
         bq_gain = (float)gain_uV / 1000.0f; // 转换为 mV/LSB
     }else {
@@ -218,7 +228,7 @@ float Get_Temp_Celsius(void) {
     BQ76920_ReadReg_CRC(0x2C, &t_hi);
     BQ76920_ReadReg_CRC(0x2D, &t_lo);
     uint16_t adc = ((uint16_t)(t_hi & 0x3F) << 8) | t_lo;
-
+	debug_val = adc;
     if (adc >= 16383 || adc == 0) return -99.0f;
 
     // 使用实测的两点斜率公式：Temp = 20 + (adc - 4420) * (-0.053)
@@ -256,6 +266,39 @@ void send_packet(uint8_t id, uint16_t value) {
 	
 	HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5); // 发送led显示
 }
+
+void Check_Protections(uint16_t *v_cells, int16_t current, float temp) {
+    uint8_t current_errors = 0;
+
+    // 1. 检查各项保护
+    // 欠压
+    uint16_t min_v = v_cells[0];
+    for(int i=1; i<4; i++) if(v_cells[i] < min_v) min_v = v_cells[i];
+    
+    if (min_v < PROT_UV) {
+        // 每 100ms 调用一次，累加 20 次即为 2 秒
+        if (uv_counter < 20) uv_counter++;
+        else current_errors |= 0x01; 
+    } else {
+        uv_counter = 0; // 恢复正常立刻重置
+    }
+
+    // 过压
+    for(int i=0; i<4; i++) if (v_cells[i] > PROT_OV) current_errors |= 0x02;
+
+    // 温度
+    if (temp > PROT_OT || temp < PROT_UT) current_errors |= 0x04;
+
+    // 2. 更新全局标志
+    error_flag = current_errors;
+
+    // 3. 动作执行：只要有错，立刻关断
+    if (error_flag != 0) {
+        BQ76920_Set_MOS(0, 0); 
+        mos_state = 0;
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3 | GPIO_PIN_4, GPIO_PIN_RESET);
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -289,6 +332,7 @@ int main(void)
   MX_GPIO_Init();
   MX_I2C1_Init();
   MX_USART1_UART_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   
   BQ76920_Boot(); // 第一步：唤醒芯片
@@ -308,6 +352,26 @@ int main(void)
           HAL_Delay(500);
       }
   }
+  
+    // --- 硬件保护配置 ---
+	// 1. PROTECT1 (0x06): 配置短路保护 (SCD)
+	// 设置 SCD 阈值为 44mV (对应 3mOhm 下约 14.6A), 延时 100us
+	// 查表得：0x00 (22mV), 0x01 (33mV), 0x02 (44mV)...
+	BQ76920_WriteReg_CRC(0x06, 0x02); 
+  HAL_Delay(10);
+
+	// 2. PROTECT2 (0x07): 配置过流保护 (OCD)
+	// 设置 OCD 阈值为 17mV (对应 3mOhm 下约 5.6A), 延时 160ms
+	// 查表得：0x00 (8mV), 0x01 (11mV), 0x02 (14mV), 0x03 (17mV)...
+	BQ76920_WriteReg_CRC(0x07, 0x03);
+  HAL_Delay(10);
+
+	// 3. PROTECT3 (0x08): 配置欠压/过压延时
+	// 这个寄存器通常保持默认即可，或者根据需要调整硬件 UV/OV 的动作延迟
+	BQ76920_WriteReg_CRC(0x08, 0x00);
+  HAL_Delay(10);
+  
+  // --- 数据采集配置 ---
   // 在读取之前，先尝试清除所有状态寄存器，防止之前的错误挂起
   BQ76920_WriteReg_CRC(0x00, 0xFF); 
   HAL_Delay(10);
@@ -354,74 +418,55 @@ int main(void)
 		bq_gain = 0.381f; // 这是一个非常典型的增益值
 	}
 	bq_gain = bq_gain * 1.0102f;
+	
+	HAL_TIM_Base_Start_IT(&htim2); // 以中断模式启动 TIM2
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   { 
-	  /*
-      // 发送 ID 为 1 的测试数据，每秒数值自增
-    send_packet(1, test_val++); 
-    if(test_val > 4200) test_val = 0;
-	  */
-	  // 关放电按钮检测
+	  // --- 核心优化 1：按键处理 (实时响应，不受 Delay 影响) ---
     if (button_pressed_flag) {
-        button_pressed_flag = 0; // 清除标志
-        mos_state = !mos_state;  // 切换状态
-
-        if (mos_state) {
-            BQ76920_Set_MOS(1, 1);
-            // 验证并点亮 LED
-            uint8_t actual_ctrl2 = 0;
-            if(BQ76920_ReadReg_CRC(0x05, &actual_ctrl2) == HAL_OK) {
-                if (actual_ctrl2 & 0x01) HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_SET);
-                if (actual_ctrl2 & 0x02) HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
-            }
-        } else {
-            BQ76920_Set_MOS(0, 0);
-            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3 | GPIO_PIN_4, GPIO_PIN_RESET);
+        button_pressed_flag = 0;
+        if (error_flag == 0) { // 只有无故障时才允许手动操作
+            mos_state = !mos_state;
+            BQ76920_Set_MOS(mos_state, mos_state);
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3 | GPIO_PIN_4, mos_state ? GPIO_PIN_SET : GPIO_PIN_RESET);
         }
     }
-	  
-    // 1-4. 发送电压 (mV)
-    uint16_t min_v = 5000;
-    for (uint8_t i = 0; i < 4; i++) {
-        uint16_t v = Get_Cell_Voltage_mV(cell_index_map[i]);
-        if (v < min_v && v > 1000) min_v = v; // 找最小单体用于算 SOC
-        send_packet(i + 1, v);
-        HAL_Delay(50);
+
+    // --- 核心优化 2：基于定时器的任务分发 ---
+    if (timer_100ms_flag) {
+        timer_100ms_flag = 0;
+        task_counter++;
+
+        // 每 200ms 运行一次：保护检查 (高频任务)
+        if (task_counter % 2 == 0) {
+            for(int i=0; i<4; i++) cells[i] = Get_Cell_Voltage_mV(cell_index_map[i]);
+            curr = Get_Current_mA();
+            t = Get_Temp_Celsius();
+            Check_Protections(cells, curr, t);
+        }
+
+        // 每 1000ms 运行一次：Telemetry 数据发送 (低频任务)
+        if (task_counter >= 10) {
+            task_counter = 0;
+            
+            // 采用分段发送法，防止 UART 瞬时占用过多带宽
+            send_packet(1, cells[0]);
+            send_packet(2, cells[1]);
+            send_packet(3, cells[2]);
+            send_packet(4, cells[3]);
+            send_packet(5, (uint16_t)curr);
+            send_packet(6, (uint16_t)(t * 10.0f)); // 修正：先乘浮点再转整型
+            
+            uint16_t min_v = 5000;
+            for(int i=0; i<4; i++) if(cells[i] < min_v && cells[i] > 1000) min_v = cells[i];
+            send_packet(7, Calculate_SOC(min_v));
+            send_packet(8, (uint16_t)debug_val);
+        }
     }
-/*
-	uint8_t stat;
-	BQ76920_ReadReg_CRC(0x00, &stat);
-
-	if (stat & 0x80) { // 检查 CC_READY 位
-		int16_t current = Get_Current_mA();
-		send_packet(5, (uint16_t)current);
-		
-		// 清除 CC_READY 位，准备下一次转换
-		BQ76920_WriteReg_CRC(0x00, 0x80); 
-	}
-*/
-    // 5. 发送电流 (mA)
-    int16_t current = Get_Current_mA();
-    send_packet(5, (uint16_t)current); 
-    HAL_Delay(50);
-
-    // 6. 发送温度 (放大10倍发送，如 25.5度 发送 255)
-    int16_t temp_x10 = (int16_t)(Get_Temp_Celsius() * 10.0f);
-    send_packet(6, (uint16_t)temp_x10);
-    HAL_Delay(50);
-
-    // 7. 发送 SOC (0.1%)，匹配你的 OLED 显示
-    send_packet(7, Calculate_SOC(min_v));
-	HAL_Delay(50);
-   
-   // 8. 发送调试变量
-   send_packet(8, (uint16_t)debug_val);
-   
-    HAL_Delay(1000);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -468,6 +513,11 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM2) {
+        timer_100ms_flag = 1; // 触发心跳标志
+    }
+}
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == GPIO_PIN_2) {
