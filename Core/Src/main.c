@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "dma.h"
 #include "i2c.h"
 #include "tim.h"
 #include "usart.h"
@@ -259,12 +260,19 @@ uint16_t Calculate_SOC(uint16_t v_min_mv) {
 
 // 辅助发送函数
 void send_packet(uint8_t id, uint16_t value) {
-    tx_packet[0] = id;
-    tx_packet[1] = (uint8_t)(value >> 8);
-    tx_packet[2] = (uint8_t)(value & 0xFF);
-    HAL_UART_Transmit(&huart1, tx_packet, 3, 50);
-	
-	HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5); // 发送led显示
+    static uint8_t temp_buf[3]; 
+
+	// 如果 DMA 还在忙（虽然 3 字节在 9600 波特率下只需 3ms，几乎不会发生）
+    // 这种判定是“非阻塞”的，如果忙就直接放弃这一包，保证系统不卡死
+    if (huart1.gState != HAL_UART_STATE_READY) {
+        return; 
+    }
+
+    temp_buf[0] = id;
+    temp_buf[1] = (uint8_t)(value >> 8);
+    temp_buf[2] = (uint8_t)(value & 0xFF);
+
+    HAL_UART_Transmit_DMA(&huart1, temp_buf, 3);
 }
 
 void Check_Protections(uint16_t *v_cells, int16_t current, float temp) {
@@ -276,8 +284,8 @@ void Check_Protections(uint16_t *v_cells, int16_t current, float temp) {
     for(int i=1; i<4; i++) if(v_cells[i] < min_v) min_v = v_cells[i];
     
     if (min_v < PROT_UV) {
-        // 每 100ms 调用一次，累加 20 次即为 2 秒
-        if (uv_counter < 20) uv_counter++;
+        // 每 200ms 调用一次，累加 10 次即为 2 秒
+        if (uv_counter < 10) uv_counter++;
         else current_errors |= 0x01; 
     } else {
         uv_counter = 0; // 恢复正常立刻重置
@@ -296,8 +304,9 @@ void Check_Protections(uint16_t *v_cells, int16_t current, float temp) {
     if (error_flag != 0) {
         BQ76920_Set_MOS(0, 0); 
         mos_state = 0;
-        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3 | GPIO_PIN_4, GPIO_PIN_RESET);
-    }
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_RESET);	// mos管状态灯
+		HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET); 	// 错误报警灯
+	}
 }
 /* USER CODE END 0 */
 
@@ -330,6 +339,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_I2C1_Init();
   MX_USART1_UART_Init();
   MX_TIM2_Init();
@@ -432,7 +442,7 @@ int main(void)
         if (error_flag == 0) { // 只有无故障时才允许手动操作
             mos_state = !mos_state;
             BQ76920_Set_MOS(mos_state, mos_state);
-            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3 | GPIO_PIN_4, mos_state ? GPIO_PIN_SET : GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, mos_state ? GPIO_PIN_SET : GPIO_PIN_RESET);
         }
     }
 
@@ -450,22 +460,23 @@ int main(void)
         }
 
         // 每 1000ms 运行一次：Telemetry 数据发送 (低频任务)
-        if (task_counter >= 10) {
-            task_counter = 0;
-            
-            // 采用分段发送法，防止 UART 瞬时占用过多带宽
-            send_packet(1, cells[0]);
-            send_packet(2, cells[1]);
-            send_packet(3, cells[2]);
-            send_packet(4, cells[3]);
-            send_packet(5, (uint16_t)curr);
-            send_packet(6, (uint16_t)(t * 10.0f)); // 修正：先乘浮点再转整型
-            
-            uint16_t min_v = 5000;
-            for(int i=0; i<4; i++) if(cells[i] < min_v && cells[i] > 1000) min_v = cells[i];
-            send_packet(7, Calculate_SOC(min_v));
-            send_packet(8, (uint16_t)debug_val);
-        }
+        switch (task_counter) {
+			case 1: send_packet(1, cells[0]); break;
+			case 2: send_packet(2, cells[1]); break;
+			case 3: send_packet(3, cells[2]); break;
+			case 4: send_packet(4, cells[3]); break;
+			case 5: send_packet(5, (uint16_t)curr); break;
+			case 6: send_packet(6, (uint16_t)(t * 10.0f)); break;
+			case 7: {
+				uint16_t min_v = 5000;
+				for(int i=0; i<4; i++) if(cells[i] < min_v && cells[i] > 1000) min_v = cells[i];
+				send_packet(7, Calculate_SOC(min_v));
+				break;
+			}
+			case 8: send_packet(8, (uint16_t)debug_val); break;
+			case 10: task_counter = 0; break; // 1秒周期结束，复位
+			default: break;
+		}
     }
     /* USER CODE END WHILE */
 
@@ -518,6 +529,17 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         timer_100ms_flag = 1; // 触发心跳标志
     }
 }
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if(huart->Instance == USART1)
+    {
+        // 如果能跑到这里，说明 DMA 正常完成了任务，gState 会自动变回 READY
+        // 你可以在这里放一个测试代码，比如翻转另一个 LED
+		HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5); 
+    }
+}
+
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == GPIO_PIN_2) {
