@@ -37,11 +37,11 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define BQ_ADDR (0x08 << 1) // 7位地址0x08，HAL库需要左移一位变成0x10
-#define PROT_UV    3000   // 欠压保护 3.0V
+#define PROT_UV    3000   // 欠压保护 3.0V，18650 电芯的截止电压通常在 2.5V-2.75V
 #define PROT_OV    4200   // 过充保护 4.2V
 #define PROT_OT    60.0f  // 过温保护 60℃
 #define PROT_UT    -5.0f  // 低温保护 -5℃ (禁止充电)
-#define PROT_OC    20000  // 过流保护 20A (根据你的分流电阻能力)
+#define PROT_OC    15000  // 过流保护 15A，保险丝20A，电子保护（BMS）应该先于物理保护（保险丝）触发
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -66,10 +66,11 @@ int16_t debug_val = 0;
 uint16_t cells[4];
 int16_t curr;
 float t;
-uint8_t error_flag = 0;
+uint8_t error_flag;
 volatile uint8_t timer_100ms_flag = 0;
 uint16_t task_counter = 0;
 uint16_t uv_counter = 0; // 欠压计数器
+uint16_t comm_fail_counter; // iic连接失败计数器
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -226,16 +227,48 @@ int16_t Get_Current_mA(void) {
 // 温度测量
 float Get_Temp_Celsius(void) {
     uint8_t t_hi, t_lo;
+    // 1. 读取原始 ADC 值
     BQ76920_ReadReg_CRC(0x2C, &t_hi);
     BQ76920_ReadReg_CRC(0x2D, &t_lo);
     uint16_t adc = ((uint16_t)(t_hi & 0x3F) << 8) | t_lo;
-	debug_val = adc;
+    
+    debug_val = adc; // 保留你的调试变量
+
+    // 2. 基础错误检查
     if (adc >= 16383 || adc == 0) return -99.0f;
 
-    // 使用实测的两点斜率公式：Temp = 20 + (adc - 4420) * (-0.053)
-    float temp = 20.0f + (float)(adc - 4420) * (-0.0535f) - 1.3f;
-    
-    return temp;
+    // 3. 定制查找表 (基于 B=3435, REGOUT=3.14V, NTC接地)
+    // 注意：ADC 随温度升高而减小，所以是降序排列
+    typedef struct {
+        int8_t temp;
+        uint16_t adc;
+    } TempTable;
+
+    static const TempTable NTC_LUT[] = {
+        {-5, 6234}, {0, 5902}, {5, 5518}, {10, 5093}, {15, 4643},
+        {20, 4185}, {25, 3739}, {30, 3314}, {35, 2919}, {40, 2560},
+        {45, 2238}, {50, 1954}, {55, 1705}, {60, 1488}
+    };
+
+    // 4. 边界处理
+    if (adc >= NTC_LUT[0].adc) return -5.0f;
+    if (adc <= NTC_LUT[13].adc) return 60.0f;
+
+    // 5. 查表与线性插值
+    for (int i = 0; i < 13; i++) {
+        // 因为 ADC 是降序，判断当前 adc 是否落在 [i] 和 [i+1] 之间
+        if (adc <= NTC_LUT[i].adc && adc > NTC_LUT[i+1].adc) {
+            float t0 = (float)NTC_LUT[i].temp;
+            float t1 = (float)NTC_LUT[i+1].temp;
+            float a0 = (float)NTC_LUT[i].adc;
+            float a1 = (float)NTC_LUT[i+1].adc;
+
+            // 插值计算公式
+            return t0 + (float)(adc - a0) * (t1 - t0) / (a1 - a0);
+        }
+    }
+
+    return -99.0f;
 }
 
 // 容量 SOC 计算
@@ -275,8 +308,8 @@ void send_packet(uint8_t id, uint16_t value) {
     HAL_UART_Transmit_DMA(&huart1, temp_buf, 3);
 }
 
+// 软件保护检测
 void Check_Protections(uint16_t *v_cells, int16_t current, float temp) {
-    uint8_t current_errors = 0;
 
     // 1. 检查各项保护
     // 欠压
@@ -286,21 +319,18 @@ void Check_Protections(uint16_t *v_cells, int16_t current, float temp) {
     if (min_v < PROT_UV) {
         // 每 200ms 调用一次，累加 10 次即为 2 秒
         if (uv_counter < 10) uv_counter++;
-        else current_errors |= 0x01; 
+        else error_flag |= 0x01; 
     } else {
         uv_counter = 0; // 恢复正常立刻重置
     }
 
     // 过压
-    for(int i=0; i<4; i++) if (v_cells[i] > PROT_OV) current_errors |= 0x02;
+    for(int i=0; i<4; i++) if (v_cells[i] > PROT_OV) error_flag |= 0x02;
 
     // 温度
-    if (temp > PROT_OT || temp < PROT_UT) current_errors |= 0x04;
+    if (temp > PROT_OT || temp < PROT_UT) error_flag |= 0x04;
 
-    // 2. 更新全局标志
-    error_flag = current_errors;
-
-    // 3. 动作执行：只要有错，立刻关断
+    // 2. 动作执行：只要有错，立刻关断
     if (error_flag != 0) {
         BQ76920_Set_MOS(0, 0); 
         mos_state = 0;
@@ -365,21 +395,25 @@ int main(void)
   
     // --- 硬件保护配置 ---
 	// 1. PROTECT1 (0x06): 配置短路保护 (SCD)
-	// 设置 SCD 阈值为 44mV (对应 3mOhm 下约 14.6A), 延时 100us
-	// 查表得：0x00 (22mV), 0x01 (33mV), 0x02 (44mV)...
-	BQ76920_WriteReg_CRC(0x06, 0x02); 
+	// SCD Threshold 111mV (37A), Delay 200us
+	BQ76920_WriteReg_CRC(0x06, 0x14);
   HAL_Delay(10);
 
 	// 2. PROTECT2 (0x07): 配置过流保护 (OCD)
-	// 设置 OCD 阈值为 17mV (对应 3mOhm 下约 5.6A), 延时 160ms
-	// 查表得：0x00 (8mV), 0x01 (11mV), 0x02 (14mV), 0x03 (17mV)...
-	BQ76920_WriteReg_CRC(0x07, 0x03);
+	// OCD Threshold 61mV (20.33A), Delay 640ms
+	BQ76920_WriteReg_CRC(0x07, 0x5C);
   HAL_Delay(10);
 
 	// 3. PROTECT3 (0x08): 配置欠压/过压延时
-	// 这个寄存器通常保持默认即可，或者根据需要调整硬件 UV/OV 的动作延迟
+	// UV Delay 1s, OV Delay 1s (保持默认)
 	BQ76920_WriteReg_CRC(0x08, 0x00);
   HAL_Delay(10);
+  
+    // 4. OV_TRIP设置硬件过压防线 (约4.25V)
+	BQ76920_WriteReg_CRC(0x09, 0xBF); 
+  
+	// 5. UV_TRIP设置硬件欠压防线 (约3.0V)
+	BQ76920_WriteReg_CRC(0x0A, 0xF0);
   
   // --- 数据采集配置 ---
   // 在读取之前，先尝试清除所有状态寄存器，防止之前的错误挂起
@@ -429,6 +463,8 @@ int main(void)
 	}
 	bq_gain = bq_gain * 1.0102f;
 	
+	error_flag = 0; // 手动复位清除错误
+	
 	HAL_TIM_Base_Start_IT(&htim2); // 以中断模式启动 TIM2
   /* USER CODE END 2 */
 
@@ -436,7 +472,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   { 
-	  // --- 核心优化 1：按键处理 (实时响应，不受 Delay 影响) ---
+	  // 按键处理 (实时响应，不受 Delay 影响) ---
     if (button_pressed_flag) {
         button_pressed_flag = 0;
         if (error_flag == 0) { // 只有无故障时才允许手动操作
@@ -446,18 +482,28 @@ int main(void)
         }
     }
 
-    // --- 核心优化 2：基于定时器的任务分发 ---
+    // 基于定时器的任务分发 ---
     if (timer_100ms_flag) {
         timer_100ms_flag = 0;
         task_counter++;
 
         // 每 200ms 运行一次：保护检查 (高频任务)
         if (task_counter % 2 == 0) {
-            for(int i=0; i<4; i++) cells[i] = Get_Cell_Voltage_mV(cell_index_map[i]);
-            curr = Get_Current_mA();
-            t = Get_Temp_Celsius();
-            Check_Protections(cells, curr, t);
-        }
+			HAL_StatusTypeDef comm_stat = HAL_OK;
+			// 依次读取，若有任何一步通信失败，comm_stat 会记录
+			comm_stat |= BQ76920_ReadReg_CRC(0x00, &sys_stat); 
+			for(int i=0; i<4; i++) cells[i] = Get_Cell_Voltage_mV(cell_index_map[i]);
+			curr = Get_Current_mA();
+			t = Get_Temp_Celsius();
+
+			if(comm_stat != HAL_OK) {
+				error_flag |= 0x10; // 通信故障标志
+			} else {
+				error_flag &= ~0x10;
+			}
+
+			Check_Protections(cells, curr, t);
+		}
 
         // 每 1000ms 运行一次：Telemetry 数据发送 (低频任务)
         switch (task_counter) {
@@ -473,7 +519,7 @@ int main(void)
 				send_packet(7, Calculate_SOC(min_v));
 				break;
 			}
-			case 8: send_packet(8, (uint16_t)debug_val); break;
+			case 8: send_packet(8, (uint16_t)error_flag); break;
 			case 10: task_counter = 0; break; // 1秒周期结束，复位
 			default: break;
 		}
